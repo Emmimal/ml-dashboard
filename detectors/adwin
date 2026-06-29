@@ -1,0 +1,72 @@
+"""
+ADWIN (ADaptive WINdowing) sequential drift detector.
+
+Ported from Article 09. Maintains an adaptive window of recent observations
+and fires when the means of an old sub-window and a recent sub-window
+diverge beyond a Hoeffding-bound-derived threshold.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import List
+
+
+@dataclass
+class ADWINState:
+    t: int
+    window_size: int
+
+
+class ADWIN:
+    def __init__(self, delta: float = 0.002, max_buckets: int = 5):
+        self.delta = delta
+        self.max_buckets = max_buckets
+        self._window: List[float] = []
+        self.t = 0
+
+    def _hoeffding_bound(self, n0: int, n1: int) -> float:
+        n = n0 + n1
+        if n0 == 0 or n1 == 0:
+            return float("inf")
+        m = 1.0 / ((1.0 / n0) + (1.0 / n1))
+        delta_prime = self.delta / n
+        return math.sqrt((1.0 / (2 * m)) * math.log(4.0 / delta_prime))
+
+    def update(self, value: float) -> bool:
+        """Add one observation. Returns True if drift was detected and the
+        older portion of the window was dropped."""
+        self.t += 1
+        self._window.append(value)
+
+        drift_detected = False
+        # Check all possible split points from the most recent backwards.
+        # For readability this is O(n) per call; production deployments with
+        # very long windows should use the bucketed ADWIN2 variant.
+        n = len(self._window)
+        cut_point = None
+        for split in range(1, n):
+            w0 = self._window[:split]
+            w1 = self._window[split:]
+            n0, n1 = len(w0), len(w1)
+            if n0 < 1 or n1 < 1:
+                continue
+            mean0 = sum(w0) / n0
+            mean1 = sum(w1) / n1
+            bound = self._hoeffding_bound(n0, n1)
+            if abs(mean0 - mean1) > bound:
+                cut_point = split
+                drift_detected = True
+                break
+
+        if drift_detected and cut_point is not None:
+            self._window = self._window[cut_point:]
+
+        return drift_detected
+
+    def state(self) -> ADWINState:
+        return ADWINState(t=self.t, window_size=len(self._window))
+
+    def reset(self) -> None:
+        self._window = []
