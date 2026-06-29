@@ -1,0 +1,122 @@
+"""
+Step 2: Building the Streamlit Dashboard (Full Code).
+
+Entry point. Run with:
+    streamlit run dashboard/app.py
+
+This page gives the top-level health view: latest batch status, rolling
+accuracy, and the alert feed. Drift score time series and calibration
+plots live on their own pages (dashboard/pages/) so the app stays fast —
+each page only loads what it renders.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Allow `streamlit run dashboard/app.py` to resolve sibling packages
+# (detectors, monitors, data, alerts) when launched from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pandas as pd
+import streamlit as st
+
+from data.logging_store import init_db, list_batch_ids, load_alerts, load_monitor_reports
+
+st.set_page_config(
+    page_title="ML Monitoring Dashboard",
+    page_icon="📊",
+    layout="wide",
+)
+
+DB_PATH = st.sidebar.text_input("Database path", value="data/monitoring.db")
+init_db(DB_PATH)  # no-op if tables already exist; lets a fresh demo run without crashing
+
+st.title("📊 ML Monitoring Dashboard")
+st.caption(
+    "Reads directly from the SQLite logging store. Run "
+    "`python -m benchmarks.run_pipeline --scenario <name>` to populate it."
+)
+
+batch_ids = list_batch_ids(DB_PATH)
+
+if not batch_ids:
+    st.warning(
+        "No logged predictions found yet. Run the pipeline first:\n\n"
+        "```bash\npython -m benchmarks.run_pipeline --scenario abrupt --db data/monitoring.db\n```"
+    )
+    st.stop()
+
+feature_reports = load_monitor_reports(DB_PATH, "feature")
+prediction_reports = load_monitor_reports(DB_PATH, "prediction")
+performance_reports = load_monitor_reports(DB_PATH, "performance")
+alerts = load_alerts(DB_PATH)
+
+latest_batch = max(batch_ids)
+latest_perf = next((r for r in performance_reports if r["batch_id"] == latest_batch), None)
+latest_feat = next((r for r in feature_reports if r["batch_id"] == latest_batch), None)
+
+st.subheader(f"Latest batch: {latest_batch}")
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    if latest_perf:
+        acc = latest_perf["payload"]["accuracy"]
+        delta = latest_perf["payload"]["acc_delta"]
+        st.metric("Accuracy", f"{acc:.3f}", delta=f"{delta:+.3f}", delta_color="normal")
+    else:
+        st.metric("Accuracy", "—", help="No ground truth labeled yet for this batch")
+
+with col2:
+    if latest_perf:
+        f1 = latest_perf["payload"]["f1_macro"]
+        f1_delta = latest_perf["payload"]["f1_delta"]
+        st.metric("F1 (macro)", f"{f1:.3f}", delta=f"{f1_delta:+.3f}")
+    else:
+        st.metric("F1 (macro)", "—")
+
+with col3:
+    if latest_perf:
+        ece = latest_perf["payload"]["ece"]
+        ece_status = "🔴" if ece > 0.20 else ("🟡" if ece > 0.10 else "🟢")
+        st.metric("ECE", f"{ece:.3f}", help=f"{ece_status} <0.05 well-calibrated, >0.10 unreliable")
+    else:
+        st.metric("ECE", "—")
+
+with col4:
+    drift_count = sum(1 for r in feature_reports if r["payload"]["any_drift"])
+    st.metric(
+        "Batches with feature drift",
+        f"{drift_count}/{len(feature_reports)}",
+        help="PSI or KS fired. Not all drift causes decay — check the Drift page.",
+    )
+
+st.divider()
+
+left, right = st.columns([2, 1])
+
+with left:
+    st.subheader("Rolling accuracy vs. reference")
+    if performance_reports:
+        df = pd.DataFrame([r["payload"] for r in performance_reports])
+        df["batch_id"] = [r["batch_id"] for r in performance_reports]
+        st.line_chart(df.set_index("batch_id")[["accuracy", "f1_macro"]])
+    else:
+        st.info("No labeled batches yet — performance metrics need ground truth.")
+
+with right:
+    st.subheader("Recent alerts")
+    if alerts:
+        for a in alerts[:8]:
+            icon = "🔴" if a["severity"] == "critical" else "🟡"
+            st.markdown(f"{icon} **Batch {a['batch_id']}** · {a['channel']} — {a['message']}")
+    else:
+        st.info("No alerts fired yet.")
+
+st.divider()
+st.caption(
+    "Pages: **Drift Scores** (PSI/KS/MMD over time) · **Calibration** "
+    "(confusion matrix + reliability diagram) · use the sidebar to navigate."
+)
