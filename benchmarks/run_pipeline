@@ -1,0 +1,139 @@
+"""
+Populates the SQLite logging store with a full scenario run: trains a
+champion model, streams batches through it, logs every prediction, applies
+all three monitor layers, and persists their reports. This is the script
+that stands in for "your production inference service" in the tutorial —
+run it once, then point the dashboard at the resulting .db file.
+
+Usage:
+    python -m benchmarks.run_pipeline --scenario abrupt --db data/monitoring.db
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+
+import numpy as np
+from sklearn.neighbors import NearestCentroid
+
+from alerts.dispatch import AlertConfig, dispatch_alerts_for_batch
+from data.generators import (
+    AbruptDriftGenerator,
+    GradualDriftGenerator,
+    LabelShiftGenerator,
+    StableStreamGenerator,
+)
+from data.logging_store import (
+    LoggedPrediction,
+    backfill_ground_truth,
+    init_db,
+    log_predictions,
+    save_alert,
+    save_monitor_report,
+)
+from monitors.feature_monitor import FeatureMonitor
+from monitors.performance_monitor import PerformanceMonitor
+from monitors.prediction_monitor import PredictionMonitor
+
+SCENARIOS = {
+    "stable": StableStreamGenerator,
+    "abrupt": AbruptDriftGenerator,
+    "gradual": GradualDriftGenerator,
+    "label_shift": LabelShiftGenerator,
+}
+
+FEATURE_NAMES = [f"feature_{i}" for i in range(5)]
+
+
+def run_pipeline(scenario: str, db_path: str, n_batches: int = 15, batch_size: int = 200, seed: int = 42) -> None:
+    generator_cls = SCENARIOS[scenario]
+    generator = generator_cls(n_features=5, n_classes=3, seed=seed)
+
+    X_train, y_train = generator.training_set(n_samples=1000)
+    model = NearestCentroid()
+    model.fit(X_train, y_train)
+
+    # Wrap predict_proba-like behavior: NearestCentroid has no predict_proba,
+    # so derive a softmax-over-negative-distance score, matching the
+    # confidence-scoring approach used in Article 09's benchmark.
+    def predict_with_scores(X: np.ndarray):
+        preds = model.predict(X)
+        dists = np.array(
+            [np.linalg.norm(X - centroid, axis=1) for centroid in model.centroids_]
+        ).T
+        neg_dists = -dists
+        exp_scores = np.exp(neg_dists - neg_dists.max(axis=1, keepdims=True))
+        scores = exp_scores / exp_scores.sum(axis=1, keepdims=True)
+        return preds, scores
+
+    train_preds, train_scores = predict_with_scores(X_train)
+
+    init_db(db_path)
+
+    feature_monitor = FeatureMonitor(reference=X_train, feature_names=FEATURE_NAMES, ks_alpha=0.01)
+    prediction_monitor = PredictionMonitor(
+        n_classes=3, reference_preds=train_preds, reference_scores=train_scores
+    )
+    performance_monitor = PerformanceMonitor(
+        n_classes=3,
+        reference_acc=float(np.mean(y_train == train_preds)),
+        reference_f1=0.0,  # placeholder, recomputed for clarity below
+    )
+    from sklearn.metrics import f1_score as _f1
+    performance_monitor.reference_f1 = float(_f1(y_train, train_preds, average="macro"))
+
+    alert_config = AlertConfig(dry_run=True)  # safe default: prints, never sends
+
+    start = time.time()
+    for batch in generator.stream(n_batches=n_batches, batch_size=batch_size):
+        preds, scores = predict_with_scores(batch.X)
+        confidences = scores.max(axis=1)
+
+        rows = [
+            LoggedPrediction(
+                batch_id=batch.batch_id,
+                row_in_batch=i,
+                features=batch.X[i],
+                predicted_class=int(preds[i]),
+                confidence=float(confidences[i]),
+                scores=scores[i],
+                true_class=None,  # ground truth arrives later, see below
+            )
+            for i in range(len(batch.X))
+        ]
+        log_predictions(db_path, rows)
+
+        # Real-time layer: feature + prediction monitors need no labels.
+        feature_report = feature_monitor.update(batch.X)
+        prediction_report = prediction_monitor.update(preds, scores)
+
+        save_monitor_report(db_path, batch.batch_id, "feature", feature_report.__dict__)
+        save_monitor_report(db_path, batch.batch_id, "prediction", prediction_report.__dict__)
+
+        # Simulate delayed ground truth arriving immediately in this demo
+        # (in production this would be a separate backfill job hours later).
+        backfill_ground_truth(db_path, batch.batch_id, batch.y)
+        performance_report = performance_monitor.update(batch.y, preds, scores)
+        save_monitor_report(db_path, batch.batch_id, "performance", performance_report.__dict__)
+
+        fired = dispatch_alerts_for_batch(
+            alert_config, batch.batch_id, feature_report, performance_report
+        )
+        for channel, message, delivered in fired:
+            severity = "critical" if "decay" in message or "confirmed" in message else "warning"
+            save_alert(db_path, batch.batch_id, severity, channel, message, delivered)
+
+    elapsed = time.time() - start
+    print(f"Scenario '{scenario}': {n_batches} batches logged to {db_path} in {elapsed:.2f}s")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scenario", choices=list(SCENARIOS.keys()), default="abrupt")
+    parser.add_argument("--db", default="data/monitoring.db")
+    parser.add_argument("--n-batches", type=int, default=15)
+    parser.add_argument("--batch-size", type=int, default=200)
+    args = parser.parse_args()
+
+    run_pipeline(args.scenario, args.db, n_batches=args.n_batches, batch_size=args.batch_size)
