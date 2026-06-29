@@ -1,0 +1,119 @@
+"""
+Synthetic Gaussian-mixture stream generators.
+
+Replicates the four scenarios from Article 09 (stable, abrupt drift,
+gradual drift, label shift) so the logging pipeline and dashboard in this
+article can be benchmarked against the same ground truth the reader has
+already seen.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterator, Tuple
+
+import numpy as np
+
+
+@dataclass
+class Batch:
+    batch_id: int
+    X: np.ndarray
+    y: np.ndarray
+
+
+def _make_class_means(n_classes: int, n_features: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.normal(loc=0.0, scale=3.0, size=(n_classes, n_features))
+
+
+class StableStreamGenerator:
+    """No drift. Every batch drawn from the same distribution as training."""
+
+    def __init__(self, n_features: int = 5, n_classes: int = 3, seed: int = 42):
+        self.n_features = n_features
+        self.n_classes = n_classes
+        self.seed = seed
+        self.means = _make_class_means(n_classes, n_features, seed)
+        self.rng = np.random.default_rng(seed)
+
+    def training_set(self, n_samples: int = 1000) -> Tuple[np.ndarray, np.ndarray]:
+        return self._draw(n_samples, self.means, priors=None)
+
+    def _draw(self, n, means, priors) -> Tuple[np.ndarray, np.ndarray]:
+        y = self.rng.choice(len(means), size=n, p=priors)
+        X = np.array([self.rng.normal(loc=means[label], scale=1.0) for label in y])
+        return X, y
+
+    def stream(self, n_batches: int = 15, batch_size: int = 200) -> Iterator[Batch]:
+        for b in range(1, n_batches + 1):
+            X, y = self._draw(batch_size, self.means, priors=None)
+            yield Batch(batch_id=b, X=X, y=y)
+
+
+class AbruptDriftGenerator(StableStreamGenerator):
+    """Step-function shift: all feature means shift by `shift_magnitude` std
+    devs starting at `change_point`."""
+
+    def __init__(self, n_features=5, n_classes=3, seed=42, change_point=5, shift_magnitude=2.0):
+        super().__init__(n_features, n_classes, seed)
+        self.change_point = change_point
+        self.shift_magnitude = shift_magnitude
+
+    def stream(self, n_batches: int = 15, batch_size: int = 200) -> Iterator[Batch]:
+        for b in range(1, n_batches + 1):
+            means = self.means
+            if b >= self.change_point:
+                means = self.means + self.shift_magnitude
+            X, y = self._draw(batch_size, means, priors=None)
+            yield Batch(batch_id=b, X=X, y=y)
+
+
+class GradualDriftGenerator(StableStreamGenerator):
+    """Linear ramp from 0% to 100% displacement between drift_start and
+    drift_end, then holds at full displacement."""
+
+    def __init__(self, n_features=5, n_classes=3, seed=42, drift_start=4, drift_end=9, shift_magnitude=2.0):
+        super().__init__(n_features, n_classes, seed)
+        self.drift_start = drift_start
+        self.drift_end = drift_end
+        self.shift_magnitude = shift_magnitude
+
+    def _displacement(self, batch_id: int) -> float:
+        if batch_id < self.drift_start:
+            return 0.0
+        if batch_id >= self.drift_end:
+            return 1.0
+        return (batch_id - self.drift_start) / (self.drift_end - self.drift_start)
+
+    def stream(self, n_batches: int = 15, batch_size: int = 200) -> Iterator[Batch]:
+        for b in range(1, n_batches + 1):
+            frac = self._displacement(b)
+            means = self.means + frac * self.shift_magnitude
+            X, y = self._draw(batch_size, means, priors=None)
+            yield Batch(batch_id=b, X=X, y=y)
+
+
+class LabelShiftGenerator(StableStreamGenerator):
+    """Class priors shift at change_point. P(X|Y) is unchanged — only the
+    class mixture weights move."""
+
+    def __init__(
+        self,
+        n_features=5,
+        n_classes=3,
+        seed=42,
+        change_point=5,
+        prior_before=(0.34, 0.33, 0.33),
+        prior_after=(0.70, 0.15, 0.15),
+    ):
+        super().__init__(n_features, n_classes, seed)
+        self.change_point = change_point
+        self.prior_before = prior_before
+        self.prior_after = prior_after
+
+    def stream(self, n_batches: int = 15, batch_size: int = 200) -> Iterator[Batch]:
+        for b in range(1, n_batches + 1):
+            priors = self.prior_before if b < self.change_point else self.prior_after
+            X, y = self._draw(batch_size, self.means, priors=list(priors))
+            yield Batch(batch_id=b, X=X, y=y)
