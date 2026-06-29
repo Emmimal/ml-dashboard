@@ -1,0 +1,116 @@
+"""
+H3: Adding Confusion Matrix and Calibration Plots.
+
+Per-batch confusion matrix (requires ground truth — pick a labeled batch)
+and a reliability diagram comparing predicted confidence to actual
+accuracy per confidence bin. This is the visual form of the ECE number on
+the overview page: ECE is the area between the diagonal and the bars
+below.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+import altair as alt
+import numpy as np
+import pandas as pd
+import streamlit as st
+from sklearn.metrics import confusion_matrix
+
+from data.logging_store import list_batch_ids, load_batch
+
+st.set_page_config(page_title="Calibration", page_icon="🎯", layout="wide")
+st.title("🎯 Confusion Matrix & Calibration")
+
+DB_PATH = st.sidebar.text_input("Database path", value="data/monitoring.db", key="calib_db_path")
+
+batch_ids = list_batch_ids(DB_PATH)
+if not batch_ids:
+    st.warning("No data logged yet. Run the pipeline script first.")
+    st.stop()
+
+selected_batch = st.selectbox("Batch", options=batch_ids, index=len(batch_ids) - 1)
+batch_data = load_batch(DB_PATH, selected_batch)
+
+if batch_data["y_true"] is None:
+    st.info(
+        f"Batch {selected_batch} has no ground truth labels yet. "
+        "Confusion matrix and accuracy-based calibration need labeled data — "
+        "call `backfill_ground_truth()` for this batch first."
+    )
+    st.stop()
+
+y_true = batch_data["y_true"]
+y_pred = batch_data["preds"]
+scores = batch_data["scores"]
+n_classes = scores.shape[1]
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader(f"Confusion matrix — batch {selected_batch}")
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
+    cm_df = pd.DataFrame(cm, index=[f"true_{i}" for i in range(n_classes)],
+                          columns=[f"pred_{i}" for i in range(n_classes)])
+    cm_long = cm_df.reset_index().melt(id_vars="index", var_name="predicted", value_name="count")
+    cm_long = cm_long.rename(columns={"index": "actual"})
+
+    chart = alt.Chart(cm_long).mark_rect().encode(
+        x=alt.X("predicted:N", title="Predicted class"),
+        y=alt.Y("actual:N", title="Actual class"),
+        color=alt.Color("count:Q", scale=alt.Scale(scheme="blues"), title="Count"),
+        tooltip=["actual", "predicted", "count"],
+    )
+    text = alt.Chart(cm_long).mark_text(baseline="middle").encode(
+        x="predicted:N", y="actual:N", text="count:Q",
+        color=alt.condition(alt.datum.count > cm.max() / 2, alt.value("white"), alt.value("black")),
+    )
+    st.altair_chart((chart + text).properties(height=320), use_container_width=True)
+
+with col2:
+    st.subheader(f"Reliability diagram — batch {selected_batch}")
+    st.caption("Bars at the diagonal = well calibrated. Bars below it = overconfident.")
+
+    confidences = scores.max(axis=1)
+    correctness = (y_pred == y_true).astype(float)
+
+    n_bins = 10
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_centers, bin_acc, bin_conf, bin_counts = [], [], [], []
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        mask = (confidences > lo) & (confidences <= hi) if i > 0 else (confidences >= lo) & (confidences <= hi)
+        if mask.sum() == 0:
+            continue
+        bin_centers.append((lo + hi) / 2)
+        bin_acc.append(correctness[mask].mean())
+        bin_conf.append(confidences[mask].mean())
+        bin_counts.append(int(mask.sum()))
+
+    reliability_df = pd.DataFrame(
+        {"confidence_bin": bin_centers, "accuracy": bin_acc, "count": bin_counts}
+    )
+
+    bars = alt.Chart(reliability_df).mark_bar(color="steelblue").encode(
+        x=alt.X("confidence_bin:Q", title="Confidence bin", scale=alt.Scale(domain=[0, 1])),
+        y=alt.Y("accuracy:Q", title="Observed accuracy", scale=alt.Scale(domain=[0, 1])),
+        tooltip=["confidence_bin", "accuracy", "count"],
+    )
+    diagonal = alt.Chart(pd.DataFrame({"x": [0, 1], "y": [0, 1]})).mark_line(
+        color="red", strokeDash=[4, 4]
+    ).encode(x="x:Q", y="y:Q")
+    st.altair_chart((bars + diagonal).properties(height=320), use_container_width=True)
+
+ece_val = float(
+    np.sum(
+        [
+            (c / len(confidences)) * abs(conf - acc)
+            for c, conf, acc in zip(bin_counts, bin_conf, bin_acc)
+        ]
+    )
+)
+st.metric("ECE for this batch", f"{ece_val:.4f}")
