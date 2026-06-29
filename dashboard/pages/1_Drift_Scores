@@ -1,0 +1,145 @@
+"""
+H3: Displaying Drift Scores Over Time.
+
+Per-feature PSI and KS p-values across every logged batch, plus the
+ADWIN/DDM sequential detector firing points overlaid on rolling accuracy.
+This is the page that answers "when did things start going wrong, and
+which detector noticed first" — the same question the Detector Comparison
+table in Article 09 answers in static form, but live and per-feature here.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+import altair as alt
+import pandas as pd
+import streamlit as st
+
+from data.logging_store import list_batch_ids, load_monitor_reports
+
+st.set_page_config(page_title="Drift Scores", page_icon="📈", layout="wide")
+st.title("📈 Drift Scores Over Time")
+
+DB_PATH = st.sidebar.text_input("Database path", value="data/monitoring.db", key="drift_db_path")
+
+batch_ids = list_batch_ids(DB_PATH)
+if not batch_ids:
+    st.warning("No data logged yet. Run the pipeline script first.")
+    st.stop()
+
+feature_reports = load_monitor_reports(DB_PATH, "feature")
+prediction_reports = load_monitor_reports(DB_PATH, "prediction")
+
+# --- PSI per feature, long format for Altair ---
+psi_rows = []
+for r in feature_reports:
+    for feature, value in r["payload"]["psi_values"].items():
+        psi_rows.append({"batch_id": r["batch_id"], "feature": feature, "psi": value})
+psi_df = pd.DataFrame(psi_rows)
+
+st.subheader("Population Stability Index (PSI) by feature")
+st.caption(
+    "Dashed lines mark the production thresholds from Article 09: "
+    "0.10 (investigate) and 0.20 (critical). PSI is a magnitude measure — "
+    "expect noise on a stable stream."
+)
+
+if not psi_df.empty:
+    base = alt.Chart(psi_df).mark_line(point=True).encode(
+        x=alt.X("batch_id:O", title="Batch"),
+        y=alt.Y("psi:Q", title="PSI"),
+        color=alt.Color("feature:N", title="Feature"),
+        tooltip=["batch_id", "feature", "psi"],
+    )
+    threshold_warn = alt.Chart(pd.DataFrame({"y": [0.10]})).mark_rule(
+        color="orange", strokeDash=[4, 4]
+    ).encode(y="y:Q")
+    threshold_crit = alt.Chart(pd.DataFrame({"y": [0.20]})).mark_rule(
+        color="red", strokeDash=[4, 4]
+    ).encode(y="y:Q")
+    st.altair_chart((base + threshold_warn + threshold_crit).properties(height=350), use_container_width=True)
+
+# --- KS p-values per feature ---
+ks_rows = []
+for r in feature_reports:
+    for feature, p_value in r["payload"]["ks_p_values"].items():
+        ks_rows.append({"batch_id": r["batch_id"], "feature": feature, "p_value": p_value})
+ks_df = pd.DataFrame(ks_rows)
+
+st.subheader("KS test p-value by feature")
+st.caption("Below the red line (p = 0.01) is a statistically confirmed shift, not noise.")
+
+if not ks_df.empty:
+    base = alt.Chart(ks_df).mark_line(point=True).encode(
+        x=alt.X("batch_id:O", title="Batch"),
+        y=alt.Y("p_value:Q", title="KS p-value", scale=alt.Scale(domain=[0, 1])),
+        color=alt.Color("feature:N", title="Feature"),
+        tooltip=["batch_id", "feature", "p_value"],
+    )
+    threshold = alt.Chart(pd.DataFrame({"y": [0.01]})).mark_rule(
+        color="red", strokeDash=[4, 4]
+    ).encode(y="y:Q")
+    st.altair_chart((base + threshold).properties(height=300), use_container_width=True)
+
+st.divider()
+
+# --- Label shift signal (chi-squared p-value) ---
+st.subheader("Label shift detector (chi-squared on class counts)")
+st.caption(
+    "This is the signal that catches Scenario D from Article 09 — class "
+    "priors moving while accuracy and feature PSI either stay flat or "
+    "fire falsely. Below 0.01 means the predicted-class distribution has "
+    "shifted significantly from the reference."
+)
+
+if prediction_reports:
+    pred_df = pd.DataFrame(
+        [
+            {
+                "batch_id": r["batch_id"],
+                "label_shift_p_value": r["payload"]["label_shift_p_value"],
+                "mean_confidence": r["payload"]["mean_confidence"],
+            }
+            for r in prediction_reports
+        ]
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        chart = alt.Chart(pred_df).mark_line(point=True, color="purple").encode(
+            x=alt.X("batch_id:O", title="Batch"),
+            y=alt.Y("label_shift_p_value:Q", title="Chi-squared p-value"),
+            tooltip=["batch_id", "label_shift_p_value"],
+        )
+        rule = alt.Chart(pd.DataFrame({"y": [0.01]})).mark_rule(color="red", strokeDash=[4, 4]).encode(y="y:Q")
+        st.altair_chart((chart + rule).properties(height=280), use_container_width=True)
+    with c2:
+        st.line_chart(pred_df.set_index("batch_id")[["mean_confidence"]])
+
+st.divider()
+st.subheader("Detector comparison: first batch each detector fired")
+st.caption(
+    "Computed live from the reports above — PSI uses >0.20, KS uses p<0.01, "
+    "label shift uses chi-squared p<0.01."
+)
+
+def first_fire(rows, key, op):
+    for r in sorted(rows, key=lambda x: x["batch_id"]):
+        val = r["payload"].get(key)
+        if val is not None and op(val):
+            return r["batch_id"]
+    return None
+
+psi_fire = first_fire(feature_reports, "any_drift", lambda v: v)
+label_shift_fire = first_fire(prediction_reports, "label_shift_drift", lambda v: v)
+
+summary = pd.DataFrame(
+    {
+        "Detector": ["Feature monitor (PSI/KS, any_drift)", "Label shift (chi-squared)"],
+        "First batch fired": [psi_fire or "not yet", label_shift_fire or "not yet"],
+    }
+)
+st.table(summary)
