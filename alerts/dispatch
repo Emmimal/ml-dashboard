@@ -1,0 +1,152 @@
+"""
+Step 3: Adding Slack and Email Alerts.
+
+Two delivery channels, one rule: never page someone for a PSI blip on a
+stable stream. Alerts are rate-limited per channel and severity-gated —
+only "critical" fires Slack/email by default; "warning" logs only.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import smtplib
+import time
+from dataclasses import dataclass
+from email.message import EmailMessage
+from typing import Optional
+
+import urllib.request
+
+
+@dataclass
+class AlertConfig:
+    slack_webhook_url: Optional[str] = None
+    email_smtp_host: Optional[str] = None
+    email_smtp_port: int = 587
+    email_username: Optional[str] = None
+    email_password: Optional[str] = None
+    email_from: Optional[str] = None
+    email_to: Optional[str] = None
+    min_severity_slack: str = "critical"
+    min_severity_email: str = "critical"
+    rate_limit_seconds: int = 300  # don't re-fire the same alert key within this window
+    dry_run: bool = True  # default to safe: prints instead of sending
+
+
+_SEVERITY_ORDER = {"none": 0, "warning": 1, "critical": 2}
+_last_sent: dict[str, float] = {}
+
+
+def _rate_limited(key: str, window_seconds: int) -> bool:
+    now = time.time()
+    last = _last_sent.get(key)
+    if last is not None and (now - last) < window_seconds:
+        return True
+    _last_sent[key] = now
+    return False
+
+
+def _meets_threshold(severity: str, min_severity: str) -> bool:
+    return _SEVERITY_ORDER.get(severity, 0) >= _SEVERITY_ORDER.get(min_severity, 2)
+
+
+def send_slack_alert(config: AlertConfig, message: str, severity: str) -> bool:
+    if not _meets_threshold(severity, config.min_severity_slack):
+        return False
+    if _rate_limited(f"slack:{message[:50]}", config.rate_limit_seconds):
+        return False
+
+    payload = json.dumps({"text": f"[{severity.upper()}] {message}"}).encode("utf-8")
+
+    if config.dry_run or not config.slack_webhook_url:
+        print(f"[DRY RUN] Slack alert ({severity}): {message}")
+        return True
+
+    req = urllib.request.Request(
+        config.slack_webhook_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status == 200
+    except Exception as exc:
+        print(f"Slack delivery failed: {exc}")
+        return False
+
+
+def send_email_alert(config: AlertConfig, subject: str, message: str, severity: str) -> bool:
+    if not _meets_threshold(severity, config.min_severity_email):
+        return False
+    if _rate_limited(f"email:{subject}", config.rate_limit_seconds):
+        return False
+
+    if config.dry_run or not config.email_smtp_host:
+        print(f"[DRY RUN] Email alert ({severity}): {subject} — {message}")
+        return True
+
+    msg = EmailMessage()
+    msg["Subject"] = f"[{severity.upper()}] {subject}"
+    msg["From"] = config.email_from
+    msg["To"] = config.email_to
+    msg.set_content(message)
+
+    try:
+        with smtplib.SMTP(config.email_smtp_host, config.email_smtp_port, timeout=10) as server:
+            server.starttls()
+            if config.email_username and config.email_password:
+                server.login(config.email_username, config.email_password)
+            server.send_message(msg)
+        return True
+    except Exception as exc:
+        print(f"Email delivery failed: {exc}")
+        return False
+
+
+def dispatch_alerts_for_batch(
+    config: AlertConfig,
+    batch_id: int,
+    feature_report,
+    performance_report=None,
+) -> list[tuple[str, str, bool]]:
+    """Inspect a batch's monitor reports and fire whichever alerts apply.
+    Returns a list of (channel, message, delivered) tuples for logging."""
+    results = []
+
+    if feature_report.drifted_features_psi and feature_report.drifted_features_ks:
+        # Both fired — this is the confirmed-significant case from the
+        # production recommendation in Article 09: PSI + KS agreement.
+        severity = "critical"
+        message = (
+            f"Batch {batch_id}: confirmed drift on "
+            f"{', '.join(feature_report.drifted_features_ks)} "
+            f"(PSI + KS agree)"
+        )
+        delivered = send_slack_alert(config, message, severity)
+        results.append(("slack", message, delivered))
+        delivered = send_email_alert(config, f"Drift confirmed — batch {batch_id}", message, severity)
+        results.append(("email", message, delivered))
+    elif feature_report.drifted_features_psi:
+        severity = "warning"
+        message = (
+            f"Batch {batch_id}: PSI flagged "
+            f"{', '.join(feature_report.drifted_features_psi)} "
+            f"but KS did not confirm. Investigate before acting."
+        )
+        delivered = send_slack_alert(config, message, severity)
+        results.append(("slack", message, delivered))
+
+    if performance_report is not None and performance_report.any_decay:
+        severity = "critical"
+        message = (
+            f"Batch {batch_id}: performance decay. "
+            f"accuracy delta={performance_report.acc_delta:+.4f}, "
+            f"f1 delta={performance_report.f1_delta:+.4f}"
+        )
+        delivered = send_slack_alert(config, message, severity)
+        results.append(("slack", message, delivered))
+        delivered = send_email_alert(config, f"Performance decay — batch {batch_id}", message, severity)
+        results.append(("email", message, delivered))
+
+    return results
