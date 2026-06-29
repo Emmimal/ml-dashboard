@@ -1,0 +1,68 @@
+"""
+Layer 2: Prediction Monitor.
+
+Tracks the model's prediction distribution and confidence scores without
+needing ground truth labels. Catches label shift via a chi-squared test on
+class counts, and confidence drift via a shift in mean predicted-class
+probability. Ported from Article 09.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+from scipy import stats
+
+
+@dataclass
+class PredictionMonitorReport:
+    batch_id: int
+    label_shift_drift: bool
+    label_shift_p_value: float
+    confidence_drift: bool
+    mean_confidence: float
+    reference_mean_confidence: float
+
+
+class PredictionMonitor:
+    def __init__(
+        self,
+        n_classes: int,
+        reference_preds: np.ndarray,
+        reference_scores: np.ndarray,
+        chi2_alpha: float = 0.01,
+        confidence_drift_threshold: float = 0.08,
+    ):
+        self.n_classes = n_classes
+        self.chi2_alpha = chi2_alpha
+        self.confidence_drift_threshold = confidence_drift_threshold
+
+        self.reference_class_counts = np.bincount(reference_preds, minlength=n_classes)
+        self.reference_mean_confidence = float(np.max(reference_scores, axis=1).mean())
+        self._batch_count = 0
+
+    def update(self, preds: np.ndarray, scores: np.ndarray) -> PredictionMonitorReport:
+        self._batch_count += 1
+
+        current_counts = np.bincount(preds, minlength=self.n_classes)
+        # Chi-squared goodness-of-fit: does the current class distribution
+        # match the reference distribution's proportions?
+        ref_proportions = self.reference_class_counts / self.reference_class_counts.sum()
+        expected = ref_proportions * current_counts.sum()
+        # Guard against zero-expected cells, which break chi-squared.
+        expected = np.where(expected == 0, 1e-6, expected)
+        chi2_stat, p_value = stats.chisquare(current_counts, f_exp=expected)
+
+        mean_confidence = float(np.max(scores, axis=1).mean())
+        confidence_delta = abs(mean_confidence - self.reference_mean_confidence)
+
+        return PredictionMonitorReport(
+            batch_id=self._batch_count,
+            label_shift_drift=bool(p_value < self.chi2_alpha),
+            label_shift_p_value=float(p_value),
+            confidence_drift=bool(confidence_delta > self.confidence_drift_threshold),
+            mean_confidence=mean_confidence,
+            reference_mean_confidence=self.reference_mean_confidence,
+        )
