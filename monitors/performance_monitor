@@ -1,0 +1,86 @@
+"""
+Layer 3: Performance Monitor.
+
+Computes accuracy, macro F1, and Expected Calibration Error (ECE) against
+delayed ground truth labels, and flags decay relative to a champion
+baseline. Ported from Article 09.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from sklearn.metrics import f1_score
+
+
+def expected_calibration_error(y_true: np.ndarray, y_pred: np.ndarray, scores: np.ndarray, n_bins: int = 10) -> float:
+    """ECE over the predicted-class confidence, binned into n_bins."""
+    confidences = np.max(scores, axis=1)
+    correctness = (y_pred == y_true).astype(float)
+
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    n = len(confidences)
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        in_bin = (confidences > lo) & (confidences <= hi) if i > 0 else (confidences >= lo) & (confidences <= hi)
+        if in_bin.sum() == 0:
+            continue
+        bin_confidence = confidences[in_bin].mean()
+        bin_accuracy = correctness[in_bin].mean()
+        ece += (in_bin.sum() / n) * abs(bin_confidence - bin_accuracy)
+    return float(ece)
+
+
+@dataclass
+class PerformanceMonitorReport:
+    batch_id: int
+    accuracy: float
+    f1_macro: float
+    ece: float
+    acc_delta: float
+    f1_delta: float
+    any_decay: bool
+
+
+class PerformanceMonitor:
+    def __init__(
+        self,
+        n_classes: int,
+        reference_acc: float,
+        reference_f1: float,
+        decay_threshold: float = 0.05,
+    ):
+        self.n_classes = n_classes
+        self.reference_acc = reference_acc
+        self.reference_f1 = reference_f1
+        self.decay_threshold = decay_threshold
+        self._batch_count = 0
+
+    def update(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        scores: np.ndarray,
+    ) -> PerformanceMonitorReport:
+        self._batch_count += 1
+
+        accuracy = float(np.mean(y_true == y_pred))
+        f1_macro = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+        ece = expected_calibration_error(y_true, y_pred, scores)
+
+        acc_delta = accuracy - self.reference_acc
+        f1_delta = f1_macro - self.reference_f1
+
+        any_decay = (acc_delta < -self.decay_threshold) or (f1_delta < -self.decay_threshold)
+
+        return PerformanceMonitorReport(
+            batch_id=self._batch_count,
+            accuracy=accuracy,
+            f1_macro=f1_macro,
+            ece=ece,
+            acc_delta=acc_delta,
+            f1_delta=f1_delta,
+            any_decay=any_decay,
+        )
