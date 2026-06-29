@@ -1,0 +1,180 @@
+"""
+Statistical drift detectors: Kolmogorov-Smirnov, PSI, MMD.
+
+Ported from Article 09 (ML Model Monitoring: How to Detect Data Drift and
+Model Decay in Production) so this dashboard repo is self-contained and
+runnable without depending on a separate install.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Sequence, Optional
+
+import numpy as np
+from scipy import stats
+
+
+@dataclass
+class DriftResult:
+    feature: str
+    statistic: float
+    threshold: float
+    p_value: Optional[float]
+    severity: str  # "none" | "warning" | "critical"
+    drift_detected: bool
+
+    def __str__(self) -> str:
+        tag = "DRIFT" if self.drift_detected else "OK   "
+        p_str = f"  p={self.p_value:.4f}" if self.p_value is not None else ""
+        return (
+            f"[{tag}] feature={self.feature:<22} stat={self.statistic:.4f} "
+            f"threshold={self.threshold:.4f}{p_str}  severity={self.severity}"
+        )
+
+
+class KolmogorovSmirnovDetector:
+    """Per-feature marginal distribution check via the two-sample KS test."""
+
+    def __init__(self, alpha: float = 0.01):
+        self.alpha = alpha
+
+    def detect(
+        self,
+        reference: np.ndarray,
+        current: np.ndarray,
+        feature_names: Sequence[str],
+    ) -> List[DriftResult]:
+        results = []
+        for i, name in enumerate(feature_names):
+            stat, p_value = stats.ks_2samp(reference[:, i], current[:, i])
+            if p_value < 0.01:
+                severity = "critical"
+            elif p_value < 0.05:
+                severity = "warning"
+            else:
+                severity = "none"
+            results.append(
+                DriftResult(
+                    feature=name,
+                    statistic=float(stat),
+                    threshold=self.alpha,
+                    p_value=float(p_value),
+                    severity=severity,
+                    drift_detected=p_value < self.alpha,
+                )
+            )
+        return results
+
+
+class PopulationStabilityIndex:
+    """PSI per feature. Pure magnitude measure, no p-value."""
+
+    def __init__(self, n_bins: int = 10, epsilon: float = 1e-4):
+        self.n_bins = n_bins
+        self.epsilon = epsilon
+
+    def _psi_1d(self, reference: np.ndarray, current: np.ndarray) -> float:
+        combined = np.concatenate([reference, current])
+        bins = np.linspace(combined.min(), combined.max(), self.n_bins + 1)
+        bins[0], bins[-1] = -np.inf, np.inf
+
+        ref_pct = np.histogram(reference, bins=bins)[0] / len(reference) + self.epsilon
+        cur_pct = np.histogram(current, bins=bins)[0] / len(current) + self.epsilon
+
+        ref_pct /= ref_pct.sum()
+        cur_pct /= cur_pct.sum()
+
+        return float(np.sum((cur_pct - ref_pct) * np.log(cur_pct / ref_pct)))
+
+    def detect(
+        self,
+        reference: np.ndarray,
+        current: np.ndarray,
+        feature_names: Optional[Sequence[str]] = None,
+    ) -> List[DriftResult]:
+        n_features = reference.shape[1]
+        names = feature_names or [f"feature_{i}" for i in range(n_features)]
+        results = []
+        for i, name in enumerate(names):
+            value = self._psi_1d(reference[:, i], current[:, i])
+            if value > 0.20:
+                severity = "critical"
+            elif value > 0.10:
+                severity = "warning"
+            else:
+                severity = "none"
+            results.append(
+                DriftResult(
+                    feature=name,
+                    statistic=value,
+                    threshold=0.20,
+                    p_value=None,
+                    severity=severity,
+                    drift_detected=value > 0.20,
+                )
+            )
+        return results
+
+
+@dataclass
+class MMDResult:
+    statistic: float
+    p_value: float
+    drift_detected: bool
+
+
+class MaximumMeanDiscrepancy:
+    """Joint-distribution drift test using an RBF kernel and a permutation test."""
+
+    def __init__(self, alpha: float = 0.05, n_permutations: int = 100, seed: int = 42):
+        self.alpha = alpha
+        self.n_permutations = n_permutations
+        self.rng = np.random.default_rng(seed)
+
+    @staticmethod
+    def _rbf_kernel(x: np.ndarray, y: np.ndarray, gamma: float) -> np.ndarray:
+        sq_dists = (
+            np.sum(x**2, axis=1)[:, None]
+            + np.sum(y**2, axis=1)[None, :]
+            - 2 * x @ y.T
+        )
+        return np.exp(-gamma * sq_dists)
+
+    def _mmd2(self, x: np.ndarray, y: np.ndarray, gamma: float) -> float:
+        kxx = self._rbf_kernel(x, x, gamma)
+        kyy = self._rbf_kernel(y, y, gamma)
+        kxy = self._rbf_kernel(x, y, gamma)
+        n, m = len(x), len(y)
+        term_xx = (kxx.sum() - np.trace(kxx)) / (n * (n - 1))
+        term_yy = (kyy.sum() - np.trace(kyy)) / (m * (m - 1))
+        term_xy = kxy.sum() / (n * m)
+        return float(term_xx + term_yy - 2 * term_xy)
+
+    def detect(self, reference: np.ndarray, current: np.ndarray) -> MMDResult:
+        combined = np.vstack([reference, current])
+        # Median heuristic for the RBF bandwidth
+        pairwise_sq = (
+            np.sum(combined**2, axis=1)[:, None]
+            + np.sum(combined**2, axis=1)[None, :]
+            - 2 * combined @ combined.T
+        )
+        median_sq_dist = np.median(pairwise_sq[pairwise_sq > 0])
+        gamma = 1.0 / (median_sq_dist + 1e-8)
+
+        observed = self._mmd2(reference, current, gamma)
+
+        n = len(reference)
+        null_stats = np.empty(self.n_permutations)
+        for i in range(self.n_permutations):
+            perm = self.rng.permutation(combined)
+            null_stats[i] = self._mmd2(perm[:n], perm[n:], gamma)
+
+        p_value = float(np.mean(null_stats >= observed))
+        threshold = float(np.percentile(null_stats, 100 * (1 - self.alpha)))
+
+        return MMDResult(
+            statistic=observed,
+            p_value=p_value,
+            drift_detected=observed > threshold,
+        )
