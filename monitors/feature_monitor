@@ -1,0 +1,62 @@
+"""
+Layer 1: Feature Monitor.
+
+Wraps KS and PSI detectors across a reference window and reports per-batch
+drift status for every input feature. Ported from Article 09.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Sequence
+
+import numpy as np
+
+from detectors.statistical import KolmogorovSmirnovDetector, PopulationStabilityIndex
+
+
+@dataclass
+class FeatureMonitorReport:
+    batch_id: int
+    any_drift: bool
+    drifted_features_ks: List[str] = field(default_factory=list)
+    drifted_features_psi: List[str] = field(default_factory=list)
+    psi_values: dict = field(default_factory=dict)
+    ks_p_values: dict = field(default_factory=dict)
+
+
+class FeatureMonitor:
+    def __init__(
+        self,
+        reference: np.ndarray,
+        feature_names: Sequence[str],
+        ks_alpha: float = 0.01,
+        psi_bins: int = 10,
+        rolling: bool = False,
+    ):
+        self.reference = reference
+        self.feature_names = list(feature_names)
+        self.rolling = rolling
+        self.ks = KolmogorovSmirnovDetector(alpha=ks_alpha)
+        self.psi = PopulationStabilityIndex(n_bins=psi_bins)
+        self._batch_count = 0
+
+    def update(self, batch_X: np.ndarray) -> FeatureMonitorReport:
+        self._batch_count += 1
+        ks_results = self.ks.detect(self.reference, batch_X, self.feature_names)
+        psi_results = self.psi.detect(self.reference, batch_X, self.feature_names)
+
+        drifted_ks = [r.feature for r in ks_results if r.drift_detected]
+        drifted_psi = [r.feature for r in psi_results if r.drift_detected]
+
+        if self.rolling:
+            self.reference = batch_X
+
+        return FeatureMonitorReport(
+            batch_id=self._batch_count,
+            any_drift=bool(drifted_ks or drifted_psi),
+            drifted_features_ks=drifted_ks,
+            drifted_features_psi=drifted_psi,
+            psi_values={r.feature: r.statistic for r in psi_results},
+            ks_p_values={r.feature: r.p_value for r in ks_results},
+        )
