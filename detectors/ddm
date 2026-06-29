@@ -1,0 +1,50 @@
+"""
+DDM (Drift Detection Method) sequential detector.
+
+Ported from Article 09. Tracks the running prediction error rate p and its
+standard deviation. Fires a warning when p + 2*sigma exceeds the minimum
+observed, and declares drift when p + 3*sigma exceeds it.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Optional
+
+
+class DDM:
+    def __init__(self, warning_level: float = 2.0, drift_level: float = 3.0):
+        self.warning_level = warning_level
+        self.drift_level = drift_level
+        self.n = 0
+        self.error_count = 0
+        self.p_min = float("inf")
+        self.s_min = float("inf")
+
+    def update(self, is_error: int) -> Optional[str]:
+        """is_error: 1 if the prediction was wrong, 0 if correct.
+        Returns "drift", "warning", or None."""
+        self.n += 1
+        self.error_count += is_error
+
+        p = self.error_count / self.n
+        s = math.sqrt(p * (1 - p) / self.n) if self.n > 0 else 0.0
+
+        if p + s < self.p_min + self.s_min:
+            self.p_min = p
+            self.s_min = s
+
+        if p + s > self.p_min + self.drift_level * self.s_min:
+            status = "drift"
+            # Reset after a confirmed drift, matching the reference behavior
+            # used in Article 09's benchmark runner.
+            self.n = 0
+            self.error_count = 0
+            self.p_min = float("inf")
+            self.s_min = float("inf")
+        elif p + s > self.p_min + self.warning_level * self.s_min:
+            status = "warning"
+        else:
+            status = None
+
+        return status
