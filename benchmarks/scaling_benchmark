@@ -1,0 +1,120 @@
+"""
+Scaling benchmark: how does the SQLite logging layer hold up as row count
+grows? This produces the real numbers behind the "Scaling Your Monitoring
+System for High-Volume Inference" section — measuring write throughput and
+dashboard query latency, not estimating them.
+
+Usage:
+    python -m benchmarks.scaling_benchmark
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import time
+
+import numpy as np
+
+from data.logging_store import (
+    LoggedPrediction,
+    init_db,
+    list_batch_ids,
+    load_batch,
+    load_monitor_reports,
+    log_predictions,
+)
+
+
+def make_rows(batch_id: int, n: int, rng: np.random.Generator) -> list[LoggedPrediction]:
+    return [
+        LoggedPrediction(
+            batch_id=batch_id,
+            row_in_batch=i,
+            features=rng.normal(size=5),
+            predicted_class=int(rng.integers(0, 3)),
+            confidence=float(rng.uniform(0.4, 0.99)),
+            scores=rng.dirichlet([3, 3, 3]),
+        )
+        for i in range(n)
+    ]
+
+
+def benchmark_write_throughput(total_rows: int, batch_size: int, db_path: str) -> dict:
+    init_db(db_path)
+    rng = np.random.default_rng(42)
+    n_batches = total_rows // batch_size
+
+    start = time.perf_counter()
+    for b in range(1, n_batches + 1):
+        rows = make_rows(b, batch_size, rng)
+        log_predictions(db_path, rows)
+    elapsed = time.perf_counter() - start
+
+    return {
+        "total_rows": n_batches * batch_size,
+        "n_batches": n_batches,
+        "elapsed_seconds": elapsed,
+        "rows_per_second": (n_batches * batch_size) / elapsed,
+    }
+
+
+def benchmark_query_latency(db_path: str, n_queries: int = 50) -> dict:
+    batch_ids = list_batch_ids(db_path)
+    rng = np.random.default_rng(42)
+    sample_ids = rng.choice(batch_ids, size=min(n_queries, len(batch_ids)), replace=True)
+
+    start = time.perf_counter()
+    for batch_id in sample_ids:
+        load_batch(db_path, int(batch_id))
+    elapsed = time.perf_counter() - start
+
+    return {
+        "n_queries": len(sample_ids),
+        "elapsed_seconds": elapsed,
+        "avg_query_ms": (elapsed / len(sample_ids)) * 1000,
+    }
+
+
+def run_scaling_benchmark() -> None:
+    print("Logging throughput and query latency benchmark")
+    print("Seed: 42 | Batch size: 200 rows | SQLite, single connection per call")
+    print("-" * 70)
+
+    results = []
+    for total_rows in [2_000, 10_000, 50_000, 100_000]:
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            write_stats = benchmark_write_throughput(total_rows, batch_size=200, db_path=db_path)
+            query_stats = benchmark_query_latency(db_path, n_queries=50)
+            db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
+
+            print(
+                f"rows={write_stats['total_rows']:>7,}  "
+                f"write={write_stats['rows_per_second']:>8,.0f} rows/s  "
+                f"query_p50≈{query_stats['avg_query_ms']:>6.2f}ms  "
+                f"db_size={db_size_mb:>6.2f}MB"
+            )
+            results.append(
+                {
+                    "rows": write_stats["total_rows"],
+                    "rows_per_second": write_stats["rows_per_second"],
+                    "avg_query_ms": query_stats["avg_query_ms"],
+                    "db_size_mb": db_size_mb,
+                }
+            )
+        finally:
+            os.remove(db_path)
+
+    print("-" * 70)
+    print("Interpretation: write throughput and query latency at each scale "
+          "tier above. These numbers are from a single SQLite connection on "
+          "this machine — see the article's scaling section for when to "
+          "move to batched writes, a connection pool, or a managed "
+          "time-series store.")
+    return results
+
+
+if __name__ == "__main__":
+    run_scaling_benchmark()
